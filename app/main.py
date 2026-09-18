@@ -7,6 +7,7 @@ import datetime as dt
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field, field_serializer, model_validator
 
+from .agenda import AgendaError, AgendaFragment, build_agenda
 from .alarms import AlarmError, Reminder, expand_alarms
 from .attendance import (
     AttendanceError,
@@ -31,7 +32,7 @@ UTC = dt.timezone.utc
 
 app = FastAPI(
     title="iCalendar Recurrence Expansion and Availability API",
-    version="1.6.0",
+    version="1.7.0",
     summary="Expand DTSTART/RRULE/RDATE/EXDATE and RECURRENCE-ID overrides "
     "into concrete UTC instances, intersect named calendars with "
     "local working hours to find common free time, find high-concurrency "
@@ -81,6 +82,53 @@ class ExpandResponse(BaseModel):
     window_end: dt.datetime
     count: int
     instances: list[InstanceOut]
+
+    @field_serializer("window_start", "window_end")
+    def _serialize_window(self, value: dt.datetime) -> str:
+        return _iso_z(value)
+
+
+# ---------------------------------------------------------------------------
+# POST /agenda
+# ---------------------------------------------------------------------------
+
+
+class AgendaRequest(BaseModel):
+    ics: str = Field(..., description="iCalendar (RFC 5545) text to render")
+    window_start: dt.datetime = Field(
+        ..., description="Start of the UTC query window (ISO 8601, naive = UTC)"
+    )
+    window_end: dt.datetime = Field(
+        ..., description="End of the UTC query window (ISO 8601, naive = UTC)"
+    )
+    timezone: str = Field(
+        ...,
+        description="IANA timezone used for local dates and timestamps, "
+        "e.g. 'Asia/Tokyo'",
+    )
+
+
+class AgendaEntryOut(BaseModel):
+    date: dt.date = Field(..., description="Local date this fragment is shown under")
+    uid: str
+    summary: str | None
+    start: dt.datetime = Field(..., description="Local start in the display timezone")
+    end: dt.datetime = Field(..., description="Local end in the display timezone")
+    all_day: bool
+    continues_before: bool = Field(
+        ..., description="The instance already began on an earlier local date"
+    )
+    continues_after: bool = Field(
+        ..., description="The instance continues onto a later local date"
+    )
+
+
+class AgendaResponse(BaseModel):
+    window_start: dt.datetime
+    window_end: dt.datetime
+    timezone: str
+    count: int
+    entries: list[AgendaEntryOut]
 
     @field_serializer("window_start", "window_end")
     def _serialize_window(self, value: dt.datetime) -> str:
@@ -332,6 +380,19 @@ def _instance_out(instance: Instance) -> InstanceOut:
     )
 
 
+def _agenda_entry_out(fragment: AgendaFragment) -> AgendaEntryOut:
+    return AgendaEntryOut(
+        date=fragment.date,
+        uid=fragment.uid,
+        summary=fragment.summary,
+        start=fragment.start,
+        end=fragment.end,
+        all_day=fragment.all_day,
+        continues_before=fragment.continues_before,
+        continues_after=fragment.continues_after,
+    )
+
+
 def _alarm_out(reminder: Reminder) -> AlarmOut:
     return AlarmOut(
         uid=reminder.uid,
@@ -476,6 +537,29 @@ def expand(request: ExpandRequest) -> ExpandResponse:
         window_end=window_end,
         count=len(instances),
         instances=[_instance_out(i) for i in instances],
+    )
+
+
+@app.post("/agenda", response_model=AgendaResponse)
+def agenda(request: AgendaRequest) -> AgendaResponse:
+    window_start = _to_utc(request.window_start)
+    window_end = _to_utc(request.window_end)
+    if window_start >= window_end:
+        raise HTTPException(
+            status_code=422, detail="window_start must be before window_end"
+        )
+    try:
+        fragments = build_agenda(
+            request.ics, window_start, window_end, request.timezone
+        )
+    except AgendaError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return AgendaResponse(
+        window_start=window_start,
+        window_end=window_end,
+        timezone=request.timezone,
+        count=len(fragments),
+        entries=[_agenda_entry_out(f) for f in fragments],
     )
 
 

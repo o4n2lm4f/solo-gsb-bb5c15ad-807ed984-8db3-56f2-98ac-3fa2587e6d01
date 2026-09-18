@@ -35,6 +35,12 @@ class Instance:
     end: dt.datetime  # aware UTC
     summary: str | None
     status: str
+    # True when the effective DTSTART is DATE-valued (an all-day event).
+    # DATE values carry no timezone: the expander keeps their authored
+    # calendar date as a floating midnight (normalized to UTC), so callers
+    # rendering local agendas must recover that date instead of projecting
+    # it through a display timezone.
+    all_day: bool = False
     # Raw icalendar VALARM components carried by the event that produced
     # this instance: a master's alarms apply to every recurring instance,
     # while a RECURRENCE-ID override uses only its own (possibly empty).
@@ -99,7 +105,7 @@ def _expand_group(
     if masters:
         master = masters[0]
         master_summary = _text(master, "SUMMARY")
-        m_start, m_end = _event_times(master)
+        m_start, m_end, m_all_day = _event_times(master)
         master_duration = m_end - m_start
         master_alarms = [c for c in master.subcomponents if c.name == "VALARM"]
         master_attendees = _props(master, "ATTENDEE")
@@ -116,6 +122,7 @@ def _expand_group(
                     end=start + master_duration,
                     summary=master_summary,
                     status=_status(master),
+                    all_day=m_all_day,
                     alarms=master_alarms,
                     attendees=master_attendees,
                 )
@@ -128,7 +135,7 @@ def _expand_group(
         status = _status(override)
         if status == "CANCELLED":
             continue
-        start, end = _event_times(override, default_duration=master_duration)
+        start, end, all_day = _event_times(override, default_duration=master_duration)
         summary = _text(override, "SUMMARY")
         override_attendees = _props(override, "ATTENDEE")
         instances[rid] = Instance(
@@ -138,6 +145,7 @@ def _expand_group(
             end=_to_utc(end),
             summary=summary if summary is not None else master_summary,
             status=status,
+            all_day=all_day,
             alarms=[c for c in override.subcomponents if c.name == "VALARM"],
             # An override declaring any ATTENDEE replaces the master's list
             # wholesale; one without keeps inheriting the master's.
@@ -245,7 +253,7 @@ def _validate_tzids(event) -> None:
 
 def _event_times(
     event, default_duration: dt.timedelta | None = None
-) -> tuple[dt.datetime, dt.datetime]:
+) -> tuple[dt.datetime, dt.datetime, bool]:
     start, start_is_date = _start_time(event)
     if "DTEND" in event:
         value = event["DTEND"].dt
@@ -265,7 +273,7 @@ def _event_times(
         end = start + dt.timedelta(days=1)
     else:
         end = start
-    return start, end
+    return start, end, start_is_date
 
 
 def _start_time(event) -> tuple[dt.datetime, bool]:
