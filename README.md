@@ -10,6 +10,12 @@ local working hours.
   an instance (judged against the window by its *actual* new start/end; the
   original slot is never kept) or **cancel** it via `STATUS:CANCELLED`
 - Interprets `TZID` as IANA timezones with correct DST handling
+- `/agenda` projects the UTC expansion onto an **IANA display timezone**
+  as one segment per local date: timed events crossing local midnight are
+  split at the date boundary with `continues_before`/`continues_after`,
+  and `DATE` all-day events are emitted day by day on their own floating
+  dates (never re-converted from UTC); segments sort by date, all-day
+  first, then start, then `UID`
 - `/availability` builds working hours per **local date** (DST-correct),
   clips all busy instances to them, merges half-open intervals (adjacent
   included), and returns the complement shared by every calendar
@@ -99,6 +105,116 @@ the new time (the original slot is gone):
       "start": "2026-03-16T15:00:00Z",
       "end": "2026-03-16T16:00:00Z",
       "status": "CONFIRMED"
+    }
+  ]
+}
+```
+
+### `POST /agenda`
+
+Builds a **local-date agenda** from the same recurrence engine used by
+`/expand`. The calendar is expanded against a UTC query window, and every
+instance overlapping `[window_start, window_end)` is re-projected into an
+IANA display timezone as one **segment per local date**. Request body:
+
+| Field          | Type   | Description                                                   |
+| -------------- | ------ | ------------------------------------------------------------- |
+| `ics`          | string | iCalendar text (one or more `VEVENT`s)                        |
+| `window_start` | string | Start of the UTC query window, ISO 8601 (naive = UTC)         |
+| `window_end`   | string | End of the UTC query window, ISO 8601 (naive = UTC)           |
+| `timezone`     | string | IANA timezone for the local display, e.g. `'Asia/Tokyo'`      |
+
+Segment rules:
+
+- A **timed** event that crosses local midnight is split into one fragment
+  per local date, cut at each midnight in the display timezone (DST-correct
+  day by day). Each fragment carries its own local wall-clock `start`/
+  `end`, plus `continues_before` / `continues_after` flags telling whether
+  the same event also occupies an earlier / later date.
+- A **`DATE`-valued (all-day)** event is returned once per date of its
+  local date range (exclusive `DTEND`, as in RFC 5545) with
+  `all_day: true`; `start`/`end` are the naive local midnight→midnight
+  bounds. All-day dates are floating values taken straight from the
+  calendar and are **never re-derived from UTC**, so an all-day event on
+  March 10 stays on March 10 even in a UTC−8 or UTC+9 display timezone.
+- Segments are ordered by local **date ascending**, and within a date:
+  all-day first, then local `start`, then `UID` (stable).
+- Like `/expand`, the UTC window only *selects* instances: an instance
+  overlapping a boundary contributes all of its local-date fragments,
+  with the full fragment wall times and the `continues_*` flags.
+- Cancelled instances never appear; a zero-duration timed instance
+  contributes no segment.
+
+Each segment carries `date` (`YYYY-MM-DD`, local), `uid`, `summary`,
+`all_day`, `start`, `end`, `continues_before`, `continues_after`. Timed
+`start`/`end` are **naive wall-clock times** in the display timezone (no
+offset suffix); all-day `start`/`end` are naive local midnights. The
+response also echoes `window_start`/`window_end` (UTC, `Z`), `timezone` and
+the segment `count`.
+
+### Example
+
+```bash
+curl -s http://localhost:8000/agenda \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "ics": "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//demo//EN\r\nBEGIN:VEVENT\r\nUID:night-call\r\nDTSTART;TZID=Asia/Tokyo:20260310T230000\r\nDTEND;TZID=Asia/Tokyo:20260311T010000\r\nSUMMARY:Late call\r\nEND:VEVENT\r\nBEGIN:VEVENT\r\nUID:trip\r\nDTSTART;VALUE=DATE:20260310\r\nDTEND;VALUE=DATE:20260312\r\nSUMMARY:Trip\r\nEND:VEVENT\r\nEND:VCALENDAR",
+    "window_start": "2026-03-09T00:00:00Z",
+    "window_end": "2026-03-20T00:00:00Z",
+    "timezone": "Asia/Tokyo"
+  }'
+```
+
+The call 23:00→01:00 is split at Tokyo midnight into two dated fragments
+with the continuation flags set, while the two-day `DATE` trip appears once
+per local date (all-day sorts first on the 11th):
+
+```json
+{
+  "window_start": "2026-03-09T00:00:00Z",
+  "window_end": "2026-03-20T00:00:00Z",
+  "timezone": "Asia/Tokyo",
+  "count": 4,
+  "segments": [
+    {
+      "date": "2026-03-10",
+      "uid": "trip",
+      "summary": "Trip",
+      "all_day": true,
+      "start": "2026-03-10T00:00:00",
+      "end": "2026-03-11T00:00:00",
+      "continues_before": false,
+      "continues_after": true
+    },
+    {
+      "date": "2026-03-10",
+      "uid": "night-call",
+      "summary": "Late call",
+      "all_day": false,
+      "start": "2026-03-10T23:00:00",
+      "end": "2026-03-11T00:00:00",
+      "continues_before": false,
+      "continues_after": true
+    },
+    {
+      "date": "2026-03-11",
+      "uid": "trip",
+      "summary": "Trip",
+      "all_day": true,
+      "start": "2026-03-11T00:00:00",
+      "end": "2026-03-12T00:00:00",
+      "continues_before": true,
+      "continues_after": false
+    },
+    {
+      "date": "2026-03-11",
+      "uid": "night-call",
+      "summary": "Late call",
+      "all_day": false,
+      "start": "2026-03-11T00:00:00",
+      "end": "2026-03-11T01:00:00",
+      "continues_before": true,
+      "continues_after": false
     }
   ]
 }
@@ -750,6 +866,11 @@ recurrence, unknown `TZID`).
 returns `422` when `window_start >= window_end` or when either `old_ics` or
 `new_ics` fails any of the `/expand` checks above.
 
+`/agenda` additionally returns `422` for an unknown `timezone` (non-IANA
+name) and reuses the calendar and window validation of `/expand`
+(unparsable ICS, invalid recurrence, unknown `TZID`,
+`window_start >= window_end`).
+
 `/alarms` additionally returns `422` for: an `ACTION` other than
 `DISPLAY` (or a missing `ACTION`), a `DISPLAY` alarm without
 `DESCRIPTION`, a missing or unsupported `TRIGGER` (only `DURATION` and
@@ -792,6 +913,28 @@ request body (e.g. a missing `ics` field).
 - `RDATE`/`EXDATE` support `DATE` and `DATE-TIME` values (not `PERIOD`);
   `RECURRENCE-ID` with `RANGE=THISANDFUTURE` is not supported.
 - A master event with `STATUS:CANCELLED` suppresses its whole series.
+
+### Agenda semantics
+
+- **Projection, not re-expansion**: `/agenda` expands in UTC with the
+  ordinary recurrence engine and converts each surviving instance to the
+  display timezone; local midnight boundaries are computed day by day with
+  `zoneinfo`, so DST gap/transition days are handled by wall-clock time.
+- **Timed fragments** are the intersection of the instance's local
+  interval with each local date `[midnight, next midnight)`. A fragment
+  reports `continues_before: true` when the instance started on an earlier
+  date and `continues_after: true` when it ends on a later date; an event
+  ending exactly at local midnight produces no fragment on that next date.
+- **All-day dates float**: a `DATE`-valued instance is enumerated by its
+  own dates (`DTSTART` through exclusive `DTEND`, one day when no `DTEND`
+  is given); the UTC midnight used internally for windowing is never
+  converted back, so dates are identical in every display timezone.
+- **Window selection**: as on `/expand`, inclusion is UTC overlap with
+  `[window_start, window_end)`; the window never clips a fragment's
+  displayed times or drops the other dates of an overlapping instance.
+- **Ordering** is `(date asc, all_day first, local start asc, uid asc)`;
+  ties are stable. Cancelled instances are absent and zero-duration timed
+  instances produce no segment.
 
 ### Alarm semantics
 
@@ -893,11 +1036,13 @@ uvicorn app.main:app --reload       # run locally on port 8000
 ## Project layout
 
 ```
-app/main.py          FastAPI app: POST /expand, POST /alarms,
-                     POST /attendance, POST /calendar-diff,
+app/main.py          FastAPI app: POST /expand, POST /agenda,
+                     POST /alarms, POST /attendance, POST /calendar-diff,
                      POST /availability, POST /conflicts, POST /validate,
                      GET /health
 app/expander.py      recurrence expansion, override merging, TZ/DST handling
+app/agenda.py        local-date projection: midnight splitting and all-day
+                     date enumeration in an IANA display timezone
 app/validation.py    structural VEVENT checks, stable issue codes, sorting
 app/alarms.py        VALARM parsing, REPEAT/DURATION fan-out, window filtering
 app/attendance.py    ATTENDEE inheritance, address normalization, PARTSTAT counts

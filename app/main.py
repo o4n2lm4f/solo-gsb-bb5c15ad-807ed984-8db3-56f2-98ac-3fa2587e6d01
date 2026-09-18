@@ -7,6 +7,7 @@ import datetime as dt
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field, field_serializer, model_validator
 
+from .agenda import AgendaError, AgendaSegment, build_agenda
 from .alarms import AlarmError, Reminder, expand_alarms
 from .attendance import (
     AttendanceError,
@@ -31,13 +32,14 @@ UTC = dt.timezone.utc
 
 app = FastAPI(
     title="iCalendar Recurrence Expansion and Availability API",
-    version="1.6.0",
+    version="1.7.0",
     summary="Expand DTSTART/RRULE/RDATE/EXDATE and RECURRENCE-ID overrides "
-    "into concrete UTC instances, intersect named calendars with "
-    "local working hours to find common free time, find high-concurrency "
-    "segments across named calendars, expand VALARM reminders, report "
-    "per-instance ATTENDEE participation status inside a query window, and "
-    "validate raw iCalendar text structurally.",
+    "into concrete UTC instances, project a local-date agenda in an IANA "
+    "timezone, intersect named calendars with local working hours to find "
+    "common free time, find high-concurrency segments across named "
+    "calendars, expand VALARM reminders, report per-instance ATTENDEE "
+    "participation status inside a query window, and validate raw "
+    "iCalendar text structurally.",
 )
 
 
@@ -81,6 +83,63 @@ class ExpandResponse(BaseModel):
     window_end: dt.datetime
     count: int
     instances: list[InstanceOut]
+
+    @field_serializer("window_start", "window_end")
+    def _serialize_window(self, value: dt.datetime) -> str:
+        return _iso_z(value)
+
+
+# ---------------------------------------------------------------------------
+# POST /agenda
+# ---------------------------------------------------------------------------
+
+
+class AgendaRequest(BaseModel):
+    ics: str = Field(..., description="iCalendar (RFC 5545) text to project")
+    window_start: dt.datetime = Field(
+        ..., description="Start of the UTC query window (ISO 8601, naive = UTC)"
+    )
+    window_end: dt.datetime = Field(
+        ..., description="End of the UTC query window (ISO 8601, naive = UTC)"
+    )
+    timezone: str = Field(
+        ...,
+        description="IANA timezone for the local-date display, e.g. "
+        "'Asia/Tokyo'",
+    )
+
+
+class AgendaSegmentOut(BaseModel):
+    date: dt.date = Field(..., description="Local calendar date this segment is shown on")
+    uid: str
+    summary: str | None
+    all_day: bool
+    start: dt.datetime = Field(
+        ...,
+        description="Segment start as a naive wall-clock time in the display "
+        "timezone; local midnight for an all-day segment",
+    )
+    end: dt.datetime = Field(
+        ...,
+        description="Segment end as a naive wall-clock time in the display "
+        "timezone; next local midnight (exclusive) for an all-day segment",
+    )
+    continues_before: bool = Field(
+        ...,
+        description="The same event already occupies time on an earlier date",
+    )
+    continues_after: bool = Field(
+        ...,
+        description="The same event keeps occupying time on a later date",
+    )
+
+
+class AgendaResponse(BaseModel):
+    window_start: dt.datetime
+    window_end: dt.datetime
+    timezone: str
+    count: int
+    segments: list[AgendaSegmentOut]
 
     @field_serializer("window_start", "window_end")
     def _serialize_window(self, value: dt.datetime) -> str:
@@ -332,6 +391,19 @@ def _instance_out(instance: Instance) -> InstanceOut:
     )
 
 
+def _agenda_segment_out(segment: AgendaSegment) -> AgendaSegmentOut:
+    return AgendaSegmentOut(
+        date=segment.date,
+        uid=segment.uid,
+        summary=segment.summary,
+        all_day=segment.all_day,
+        start=segment.start,
+        end=segment.end,
+        continues_before=segment.continues_before,
+        continues_after=segment.continues_after,
+    )
+
+
 def _alarm_out(reminder: Reminder) -> AlarmOut:
     return AlarmOut(
         uid=reminder.uid,
@@ -476,6 +548,29 @@ def expand(request: ExpandRequest) -> ExpandResponse:
         window_end=window_end,
         count=len(instances),
         instances=[_instance_out(i) for i in instances],
+    )
+
+
+@app.post("/agenda", response_model=AgendaResponse)
+def agenda(request: AgendaRequest) -> AgendaResponse:
+    window_start = _to_utc(request.window_start)
+    window_end = _to_utc(request.window_end)
+    if window_start >= window_end:
+        raise HTTPException(
+            status_code=422, detail="window_start must be before window_end"
+        )
+    try:
+        segments = build_agenda(
+            request.ics, window_start, window_end, request.timezone
+        )
+    except AgendaError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return AgendaResponse(
+        window_start=window_start,
+        window_end=window_end,
+        timezone=request.timezone,
+        count=len(segments),
+        segments=[_agenda_segment_out(s) for s in segments],
     )
 
 

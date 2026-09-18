@@ -44,6 +44,10 @@ class Instance:
     # override that declares any ATTENDEE replaces the whole list (an
     # override without ATTENDEE keeps inheriting the master's).
     attendees: list = field(default_factory=list)
+    # True when the event's DTSTART is a DATE value (all-day). Such an event
+    # is anchored at midnight UTC only for timeline calculations; its days
+    # are floating local dates and must never be re-converted from UTC.
+    all_day: bool = False
 
 
 def expand_calendar(
@@ -103,6 +107,7 @@ def _expand_group(
         master_duration = m_end - m_start
         master_alarms = [c for c in master.subcomponents if c.name == "VALARM"]
         master_attendees = _props(master, "ATTENDEE")
+        master_all_day = _dtstart_is_date(master)
         if _status(master) != "CANCELLED":
             occurrences, recurring = _expand_master(
                 master, m_start, master_duration, window_start, window_end
@@ -118,6 +123,7 @@ def _expand_group(
                     status=_status(master),
                     alarms=master_alarms,
                     attendees=master_attendees,
+                    all_day=master_all_day,
                 )
 
     for override in overrides:
@@ -142,6 +148,7 @@ def _expand_group(
             # An override declaring any ATTENDEE replaces the master's list
             # wholesale; one without keeps inheriting the master's.
             attendees=override_attendees if override_attendees else master_attendees,
+            all_day=_dtstart_is_date(override),
         )
 
     return list(instances.values())
@@ -282,6 +289,16 @@ def _start_time(event) -> tuple[dt.datetime, bool]:
         tz = ZoneInfo(str(tzid)) if tzid else None
         return dt.datetime.combine(value, dt.time.min, tzinfo=tz), True
     raise ExpansionError("unsupported DTSTART value type")
+
+
+def _dtstart_is_date(event) -> bool:
+    """True when the event's DTSTART property carries a DATE value."""
+    prop = event.get("DTSTART")
+    if prop is None:
+        raise ExpansionError(
+            f"VEVENT (UID {event.get('UID', '?')}) is missing DTSTART"
+        )
+    return not isinstance(prop.dt, dt.datetime)
 
 
 def _recurrence_id(event, master) -> dt.datetime:
